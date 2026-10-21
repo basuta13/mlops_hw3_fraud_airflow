@@ -38,10 +38,13 @@ COLUMNS = [
     "target",
 ]
 
-# Исходное окно обучения: январь–март 2019 включительно.
-INITIAL_WINDOW_START = "2019-01-01"
-INITIAL_WINDOW_END = "2019-03-01"
-INITIAL_NEXT_BATCH = "2019-04-01"
+# Исходное окно обучения: WINDOW_MONTHS месяцев начиная с INITIAL_WINDOW_START.
+# При WINDOW_MONTHS=4 это январь–апрель 2019, первый батч DAG — май 2019.
+WINDOW_MONTHS = int(os.getenv("WINDOW_MONTHS", "4"))
+INITIAL_WINDOW_START = os.getenv("INITIAL_WINDOW_START", "2019-01-01")
+_start = pd.Timestamp(INITIAL_WINDOW_START)
+INITIAL_WINDOW_END = (_start + pd.DateOffset(months=WINDOW_MONTHS - 1)).date().isoformat()
+INITIAL_NEXT_BATCH = (_start + pd.DateOffset(months=WINDOW_MONTHS)).date().isoformat()
 
 
 def get_db_config():

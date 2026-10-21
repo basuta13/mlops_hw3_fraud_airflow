@@ -82,7 +82,8 @@ services:
       KAFKA_SCORING_TOPIC: "scoring"
       MODELS_DIR: "/models"
     volumes:
-      - model_registry:/models
+      # Общий каталог моделей: DAG пишет сюда, сервис читает latest.txt на каждом сообщении.
+      - ./artifacts/models:/models
     depends_on:
       kafka:
         condition: service_healthy
@@ -163,6 +164,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       LABELED_CSV_PATH: /data/train.csv
       TRAINING_DATA_DIR: /training_data
+      WINDOW_MONTHS: ${WINDOW_MONTHS:-4}
+      INITIAL_WINDOW_START: "2019-01-01"
     volumes:
       - ${TRAIN_DATA_CSV}:/data/train.csv:ro
       - training_data:/training_data
@@ -195,13 +198,23 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       TRAINING_DATA_DIR: /opt/airflow/training_data
       MODELS_DIR: /opt/airflow/models
+      DQ_REPORTS_DIR: /opt/airflow/dq_reports
       FRAUD_SRC: /opt/airflow/fraud_src
+      # Свои параметры пайплайна (в семинаре: окно 3 мес., батч 100k, история 3 года)
+      WINDOW_MONTHS: ${WINDOW_MONTHS:-4}
+      SUPPLY_SAMPLE_SIZE: ${SUPPLY_SAMPLE_SIZE:-50000}
+      HISTORY_YEARS: ${HISTORY_YEARS:-2}
+      # Quality gate: новая модель выкатывается, только если она не хуже прода
+      MIN_PR_AUC_GAIN: ${MIN_PR_AUC_GAIN:-0.0}
+      ROC_AUC_TOLERANCE: ${ROC_AUC_TOLERANCE:-0.005}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./pipeline:/opt/airflow/pipeline:ro
       - ./fraud_detector/src:/opt/airflow/fraud_src:ro
       - training_data:/opt/airflow/training_data
-      - model_registry:/opt/airflow/models
+      # Каталог моделей и рядом с ним каталог DQ-отчётов, оба видны на хосте в ./artifacts
+      - ./artifacts/models:/opt/airflow/models
+      - ./artifacts/dq_reports:/opt/airflow/dq_reports
       - airflow_state:/opt/airflow/airflow_state
     ports:
       - "8081:8080"
@@ -219,5 +232,4 @@ networks:
 volumes:
   postgres_data:
   training_data:
-  model_registry:
   airflow_state:

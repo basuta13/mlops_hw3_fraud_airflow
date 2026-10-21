@@ -9,6 +9,8 @@ import pandas as pd
 import psycopg2
 from dateutil.relativedelta import relativedelta
 
+from pipeline.settings import WINDOW_MONTHS
+
 logger = logging.getLogger(__name__)
 
 LABELED_COLUMNS = [
@@ -57,7 +59,7 @@ def month_end_exclusive(month_start: date) -> date:
 
 
 def read_training_state(conn) -> dict:
-    """Читает границы трёхмесячного окна и месяц следующего батча обучения.
+    """Читает границы окна обучения и месяц следующего батча обучения.
 
     Ожидает строку id = 1 в training_state, которую создаёт data_loader.
     Возвращает словарь с ключами window_start, window_end и next_batch_month.
@@ -81,15 +83,16 @@ def read_training_state(conn) -> dict:
 
 
 def advance_training_state(conn, batch_month: date) -> None:
-    """Сдвигает окно обучения на месяц успешно опубликованного батча.
+    """Сдвигает окно обучения так, чтобы оно заканчивалось batch_month.
 
-    Новое окно заканчивается batch_month и покрывает три месяца.
-    next_batch_month становится следующим календарным месяцем.
-    Вызывать только после записи модели, чтобы повтор упавшего прогона
+    Новое окно покрывает WINDOW_MONTHS месяцев, next_batch_month становится
+    следующим календарным месяцем. Значения записываются абсолютные, а не
+    «+1 месяц», поэтому повторный вызов с тем же batch_month ничего не меняет.
+    Вызывать только после сохранения модели, чтобы повтор упавшего прогона
     не пропускал месяц.
     """
     window_end = batch_month
-    window_start = batch_month - relativedelta(months=2)
+    window_start = batch_month - relativedelta(months=WINDOW_MONTHS - 1)
     next_batch = month_end_exclusive(batch_month)
     with conn.cursor() as cur:
         cur.execute(
@@ -112,11 +115,29 @@ def advance_training_state(conn, batch_month: date) -> None:
     )
 
 
+def replace_month_batch(conn, frame: pd.DataFrame, month_start: date) -> int:
+    """Записывает батч месяца month_start в labeled_transactions идемпотентно.
+
+    В одной транзакции удаляет строки этого календарного месяца и вставляет
+    frame через COPY. Повторная запись того же батча не создаёт дублей.
+    Возвращает число удалённых перед вставкой строк.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM labeled_transactions WHERE transaction_time >= %s AND transaction_time < %s",
+            (month_start, month_end_exclusive(month_start)),
+        )
+        deleted = cur.rowcount
+    copy_labeled_frame(conn, frame)
+    return deleted
+
+
 def copy_labeled_frame(conn, frame: pd.DataFrame) -> None:
     """Дописывает строки в конец labeled_transactions через COPY.
 
     frame должен содержать колонки LABELED_COLUMNS. transaction_time
-    записывается как timestamp. Транзакция фиксируется в конце загрузки.
+    записывается как timestamp. Транзакция фиксируется в конце загрузки,
+    вместе с изменениями, сделанными в этом соединении до вызова.
     """
     payload = frame.loc[:, LABELED_COLUMNS].copy()
     payload["transaction_time"] = pd.to_datetime(payload["transaction_time"])
