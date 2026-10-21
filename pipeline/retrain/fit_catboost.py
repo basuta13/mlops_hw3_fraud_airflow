@@ -33,8 +33,11 @@ def fit_catboost(preproc_info: dict) -> dict:
     Пишет: черновик модели .staging_<version>.cbm в каталог моделей.
     latest.txt не трогает — решение о публикации принимает quality gate.
 
-    Early stopping идёт по valid-месяцу, а не по test: иначе test участвовал
-    бы в выборе числа деревьев, и сравнение с прод-моделью было бы нечестным.
+    Обучение в два прохода:
+    1. train → early stopping по valid-месяцу, находим число деревьев;
+    2. финальная модель с этим числом деревьев учится на train + valid,
+       чтобы кандидат видел столько же месяцев, сколько прод-модель.
+    Test-месяц не участвует ни в одном проходе: на нём сравниваются модели.
 
     Повторный запуск безопасен: каждый запуск пишет черновик с новой версией,
     существующие опубликованные модели и состояние окна не меняются.
@@ -47,13 +50,24 @@ def fit_catboost(preproc_info: dict) -> dict:
     x_valid, y_valid = split_xy(pd.read_parquet(preproc_info["valid_proc_path"]))
     x_test, y_test = split_xy(pd.read_parquet(preproc_info["test_proc_path"]))
 
-    model = CatBoostClassifier(**CATBOOST_PARAMS)
-    model.fit(
+    probe = CatBoostClassifier(**CATBOOST_PARAMS)
+    probe.fit(
         x_train,
         y_train,
         cat_features=CAT_FEATURES,
         eval_set=(x_valid, y_valid),
         use_best_model=True,
+    )
+    best_iteration = int(probe.get_best_iteration() or CATBOOST_PARAMS["iterations"] - 1)
+    logger.info("Early stopping по valid %s: лучшая итерация %s", preproc_info["valid_month"], best_iteration)
+
+    final_params = {k: v for k, v in CATBOOST_PARAMS.items() if k != "early_stopping_rounds"}
+    final_params["iterations"] = max(best_iteration + 1, 50)
+    model = CatBoostClassifier(**final_params)
+    model.fit(
+        pd.concat([x_train, x_valid], ignore_index=True),
+        pd.concat([y_train, y_valid], ignore_index=True),
+        cat_features=CAT_FEATURES,
     )
 
     metrics = classification_metrics(y_test, model.predict_proba(x_test)[:, 1])
@@ -75,7 +89,7 @@ def fit_catboost(preproc_info: dict) -> dict:
         "test_proc_path": preproc_info["test_proc_path"],
         "train_rows": int(len(x_train)),
         "valid_rows": int(len(x_valid)),
-        "best_iteration": int(model.get_best_iteration() or 0),
+        "best_iteration": best_iteration,
         "cleaning": preproc_info.get("cleaning"),
         "candidate_metrics": metrics,
     }
