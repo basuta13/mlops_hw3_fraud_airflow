@@ -1,4 +1,4 @@
-"""Временной train/test split трёхмесячного окна."""
+"""Временной split окна: train / validation / test по месяцам."""
 
 import logging
 
@@ -9,44 +9,66 @@ from pipeline.settings import SPLITS_DIR
 logger = logging.getLogger(__name__)
 
 
-def time_train_test_split(window_info: dict) -> dict:
-    """Делит окно по времени: два более ранних месяца в train, свежий месяц в test.
+def split_by_month(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Делит окно по времени, без перемешивания.
 
-    Читает parquet окна из window_info, сортирует по transaction_time и
-    сохраняет сырые части в splits/train_raw.parquet и splits/test_raw.parquet.
-    Колонка времени остаётся, потому что препроцессинг сам строит календарные признаки.
-    Возвращает пути к частям, месяц батча и подписи месяцев train и test.
+    test — самый свежий месяц, valid — предыдущий месяц (для early stopping),
+    train — все более ранние месяцы. Случайного split здесь нет.
     """
-    SPLITS_DIR.mkdir(parents=True, exist_ok=True)
-    frame = pd.read_parquet(window_info["dataset_path"])
+    frame = frame.copy()
     frame["transaction_time"] = pd.to_datetime(frame["transaction_time"])
     frame = frame.sort_values("transaction_time")
     periods = frame["transaction_time"].dt.to_period("M")
-    latest = periods.max()
-    train = frame.loc[periods < latest]
-    test = frame.loc[periods == latest]
-    if train.empty or test.empty:
+    months = sorted(periods.unique())
+    if len(months) < 3:
+        raise RuntimeError(f"Для train/valid/test нужно минимум 3 месяца, в окне: {months}")
+    test_month, valid_month = months[-1], months[-2]
+    train = frame.loc[periods < valid_month]
+    valid = frame.loc[periods == valid_month]
+    test = frame.loc[periods == test_month]
+    return train, valid, test
+
+
+def time_train_test_split(window_info: dict) -> dict:
+    """Делит окно по времени: ранние месяцы — train, предпоследний — valid, свежий — test.
+
+    Читает: parquet окна из window_info["dataset_path"] (pending_window.parquet).
+    Пишет: splits/train_raw.parquet, splits/valid_raw.parquet, splits/test_raw.parquet.
+    Колонка времени остаётся: препроцессинг сам строит календарные признаки.
+
+    Повторный запуск безопасен: результат детерминирован входным окном,
+    файлы просто перезаписываются, состояние в БД не меняется.
+    Test-месяц не участвует ни в обучении, ни в early stopping: на нём
+    сравниваются новая и прод-модель в quality gate.
+    """
+    SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+    frame = pd.read_parquet(window_info["dataset_path"])
+    train, valid, test = split_by_month(frame)
+    if train.empty or valid.empty or test.empty:
         raise RuntimeError(
-            f"Не удалось разрезать окно по времени: train={len(train)}, test={len(test)}"
+            f"Пустая часть split: train={len(train)}, valid={len(valid)}, test={len(test)}"
         )
 
-    train_path = SPLITS_DIR / "train_raw.parquet"
-    test_path = SPLITS_DIR / "test_raw.parquet"
-    train.to_parquet(train_path, index=False)
-    test.to_parquet(test_path, index=False)
-    train_months = sorted(periods.loc[periods < latest].unique().astype(str))
-    logger.info(
-        "Train месяцы %s (%s строк), test %s (%s строк).",
-        train_months,
-        len(train),
-        latest,
-        len(test),
-    )
-    return {
-        "train_raw_path": str(train_path),
-        "test_raw_path": str(test_path),
+    paths = {}
+    for name, part in (("train", train), ("valid", valid), ("test", test)):
+        path = SPLITS_DIR / f"{name}_raw.parquet"
+        part.to_parquet(path, index=False)
+        paths[f"{name}_raw_path"] = str(path)
+
+    def months_of(part):
+        return ",".join(sorted(part["transaction_time"].dt.to_period("M").unique().astype(str)))
+
+    info = {
+        **paths,
         "dataset_path": window_info["dataset_path"],
         "batch_month": window_info["batch_month"],
-        "train_months": ",".join(train_months),
-        "test_month": str(latest),
+        "train_months": months_of(train),
+        "valid_month": months_of(valid),
+        "test_month": months_of(test),
     }
+    logger.info(
+        "Train %s (%s строк), valid %s (%s), test %s (%s).",
+        info["train_months"], len(train), info["valid_month"], len(valid),
+        info["test_month"], len(test),
+    )
+    return info

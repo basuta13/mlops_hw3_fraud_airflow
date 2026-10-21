@@ -1,81 +1,63 @@
-"""Обучение CatBoost на новом трёхмесячном окне."""
+"""Обучение CatBoost-кандидата на новом окне."""
 
 import logging
+import os
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from pipeline.settings import CAT_FEATURES, LABEL, MODELS_DIR
+from pipeline.retrain.metrics import classification_metrics, split_xy
+from pipeline.settings import CAT_FEATURES, MODELS_DIR
 
 logger = logging.getLogger(__name__)
 
-
-def prepare_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """Отделяет target от признаков и приводит категориальные колонки к строкам.
-
-    Категории совпадают с теми, что ожидает онлайн-скоринг после run_preproc.
-    Возвращает матрицу признаков и вектор целевой переменной.
-    """
-    if LABEL not in frame.columns:
-        raise ValueError(f"В датасете нет колонки {LABEL}")
-    features = frame.drop(columns=[LABEL]).copy()
-    for column in CAT_FEATURES:
-        if column not in features.columns:
-            raise ValueError(f"После препроцессинга нет категориального признака {column}")
-        features[column] = features[column].astype(str)
-    return features, frame[LABEL]
+CATBOOST_PARAMS = {
+    "iterations": 300,
+    "depth": 6,
+    "learning_rate": 0.08,
+    "l2_leaf_reg": 5,
+    "loss_function": "Logloss",
+    "eval_metric": "PRAUC",
+    "auto_class_weights": "SqrtBalanced",
+    "early_stopping_rounds": 30,
+    "random_seed": 42,
+    "allow_writing_files": False,
+    "verbose": 50,
+}
 
 
 def fit_catboost(preproc_info: dict) -> dict:
-    """Обучает CatBoost на train и считает ROC-AUC и F1 на свежем месяце.
+    """Обучает модель-кандидата и считает её метрики на test-месяце.
 
-    Читает обработанные parquet из preproc_info. Модель учится с ранней
-    остановкой по test-месяцу и сохраняется во временный .cbm в каталоге моделей.
-    В общий latest.txt файл ещё не публикуется.
-    Возвращает версию, путь к черновику, метрики и путь к новому окну.
+    Читает: splits/{train,valid,test}_proc.parquet из preproc_info.
+    Пишет: черновик модели .staging_<version>.cbm в каталог моделей.
+    latest.txt не трогает — решение о публикации принимает quality gate.
+
+    Early stopping идёт по valid-месяцу, а не по test: иначе test участвовал
+    бы в выборе числа деревьев, и сравнение с прод-моделью было бы нечестным.
+
+    Повторный запуск безопасен: каждый запуск пишет черновик с новой версией,
+    существующие опубликованные модели и состояние окна не меняются.
+    Возвращает версию, путь к черновику и метрики кандидата.
     """
     from catboost import CatBoostClassifier
-    from sklearn.metrics import f1_score, roc_auc_score
 
-    train = pd.read_parquet(preproc_info["train_proc_path"])
-    test = pd.read_parquet(preproc_info["test_proc_path"])
-    x_train, y_train = prepare_features(train)
-    x_test, y_test = prepare_features(test)
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+    x_train, y_train = split_xy(pd.read_parquet(preproc_info["train_proc_path"]))
+    x_valid, y_valid = split_xy(pd.read_parquet(preproc_info["valid_proc_path"]))
+    x_test, y_test = split_xy(pd.read_parquet(preproc_info["test_proc_path"]))
 
-    model = CatBoostClassifier(
-        iterations=100,
-        depth=6,
-        learning_rate=0.1,
-        loss_function="Logloss",
-        eval_metric="AUC",
-        auto_class_weights="Balanced",
-        early_stopping_rounds=20,
-        random_seed=42,
-        allow_writing_files=False,
-        verbose=20,
-    )
+    model = CatBoostClassifier(**CATBOOST_PARAMS)
     model.fit(
         x_train,
         y_train,
         cat_features=CAT_FEATURES,
-        eval_set=(x_test, y_test),
+        eval_set=(x_valid, y_valid),
         use_best_model=True,
     )
 
-    proba = model.predict_proba(x_test)[:, 1]
-    pred = (proba > 0.5).astype(int)
-    f1 = float(f1_score(y_test, pred, zero_division=0))
-    if y_test.nunique() < 2:
-        roc_auc = None
-        logger.warning("В test одна метка, ROC-AUC не определён. F1=%.4f", f1)
-    else:
-        roc_auc = float(roc_auc_score(y_test, proba))
-        logger.info(
-            "Качество на test %s: ROC-AUC=%.4f, F1=%.4f",
-            preproc_info["test_month"],
-            roc_auc,
-            f1,
-        )
+    metrics = classification_metrics(y_test, model.predict_proba(x_test)[:, 1])
+    logger.info("Кандидат на test %s: %s", preproc_info["test_month"], metrics)
 
     version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,9 +70,12 @@ def fit_catboost(preproc_info: dict) -> dict:
         "dataset_path": preproc_info["dataset_path"],
         "batch_month": preproc_info["batch_month"],
         "train_months": preproc_info["train_months"],
+        "valid_month": preproc_info["valid_month"],
         "test_month": preproc_info["test_month"],
+        "test_proc_path": preproc_info["test_proc_path"],
         "train_rows": int(len(x_train)),
-        "test_rows": int(len(x_test)),
-        "roc_auc": roc_auc,
-        "f1": f1,
+        "valid_rows": int(len(x_valid)),
+        "best_iteration": int(model.get_best_iteration() or 0),
+        "cleaning": preproc_info.get("cleaning"),
+        "candidate_metrics": metrics,
     }

@@ -14,10 +14,15 @@ logger = logging.getLogger(__name__)
 def extract_month_batch() -> dict:
     """Забирает из labeled_transactions месяц, указанный в training_state.
 
-    Читает next_batch_month, выбирает наблюдения этого календарного месяца
-    и сохраняет их в parquet. Указатель месяца не меняет.
+    Читает: next_batch_month из training_state и строки этого календарного
+    месяца из labeled_transactions.
+    Пишет: batches/batch_<YYYYMM>.parquet. Указатель месяца не меняет.
+
+    Повторный запуск безопасен: указатель двигает только последняя задача
+    advance_training_window, поэтому повтор после ошибки снова берёт тот же
+    месяц и перезаписывает тот же файл батча.
+    Если строк нет, задача помечается skipped: новый месяц ещё не поставлен.
     Возвращает путь к файлу батча и месяц в формате ISO.
-    Если строк нет, помечает задачу как skipped: новый месяц ещё не поставлен.
     """
     BATCHES_DIR.mkdir(parents=True, exist_ok=True)
     conn = get_conn()
