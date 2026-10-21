@@ -1,7 +1,7 @@
 services:
   # Zookeeper (обязательный для Kafka)
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.3.0
+    image: confluentinc/cp-zookeeper:7.6.1
     networks:
       - ml-scorer
     environment:
@@ -12,7 +12,7 @@ services:
 
   # Сервис Kafka
   kafka:
-    image: confluentinc/cp-kafka:7.3.0
+    image: confluentinc/cp-kafka:7.6.1
     depends_on:
       - zookeeper
     networks:
@@ -35,7 +35,7 @@ services:
 
   # Сервис для создания топиков при старте
   kafka-setup:
-    image: confluentinc/cp-kafka:7.3.0
+    image: confluentinc/cp-kafka:7.6.1
     depends_on:
       kafka:
         condition: service_healthy  # Ждем пока Kafka станет здоровой
